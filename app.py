@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -18,7 +19,12 @@ from flask import Flask, jsonify, render_template, request
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("LAB_DATA_DIR", os.path.join(BASE_DIR, "data"))
 MAX_LOG_ENTRIES = 200
-MAX_ADD_ABS = 2 ** 62  # 防止 SQLite 64 位整数溢出
+MAX_ADD_ABS = 2 ** 62  # 单次增量上限
+INT64_MIN = -(2 ** 63)  # SQLite 整数下限，累加结果不得越界（含负向）
+INT64_MAX = 2 ** 63 - 1  # SQLite 整数上限，越界会被 SQLite 静默转成 REAL
+JS_SAFE_INT_MAX = 2 ** 53 - 1  # Number.MAX_SAFE_INTEGER，超出则用十进制字符串传输
+
+INT_PATTERN = re.compile(r"[+-]?[0-9]+")
 
 VALID_OPS = {"begin", "read", "add", "commit", "rollback"}
 OP_LABELS = {
@@ -29,6 +35,26 @@ OP_LABELS = {
 }
 
 app = Flask(__name__)
+
+
+def json_int(value):
+    """JSON 无损编码整数：安全整数范围内返回数字，超出则用十进制字符串。"""
+    if value is None:
+        return None
+    if -JS_SAFE_INT_MAX <= value <= JS_SAFE_INT_MAX:
+        return value
+    return str(value)
+
+
+def parse_int(raw):
+    """解析增量：接受 JSON 整数或十进制字符串（大整数以字符串传输），否则返回 None。"""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and INT_PATTERN.fullmatch(raw.strip()):
+        return int(raw.strip())
+    return None
 
 
 class PanelState:
@@ -86,7 +112,7 @@ class Experiment:
         panel = self.panels[side]
         return {
             "in_transaction": self.conns[side].in_transaction,
-            "last_read": panel.last_read,
+            "last_read": json_int(panel.last_read),
             "log": list(panel.log),
         }
 
@@ -127,6 +153,14 @@ def run_op(exp, side, op, value):
             elif op == "add":
                 if not conn.in_transaction:
                     return reject("禁止事务外修改：请先 BEGIN DEFERRED")
+                # 先在本事务内读出当前值，在 Python 中做精确边界检查：
+                # SQLite 对 64 位整数溢出不会报错，而是静默存成 REAL。
+                # 拒绝只影响本次操作，事务保持开启，仍可提交或回滚。
+                current = conn.execute(
+                    "SELECT val FROM kv WHERE id = 1"
+                ).fetchone()[0]
+                if not INT64_MIN <= current + value <= INT64_MAX:
+                    return reject("累加结果超出有符号 64 位整数范围，本次未修改")
                 conn.execute("UPDATE kv SET val = val + ? WHERE id = 1", (value,))
                 panel.add_log("加上 %s → 成功（尚未提交）" % value)
             elif op == "commit":
@@ -194,7 +228,7 @@ def experiment_committed(exp_id):
     exp = get_experiment(exp_id)
     if exp is None:
         return jsonify({"error": "experiment not found"}), 404
-    return jsonify({"committed": exp.committed_value()})
+    return jsonify({"committed": json_int(exp.committed_value())})
 
 
 @app.post("/api/experiments/<exp_id>/conn/<side>/op")
@@ -210,9 +244,8 @@ def experiment_op(exp_id, side):
         return jsonify({"error": "unknown op"}), 400
     value = None
     if op == "add":
-        try:
-            value = int(data.get("value"))
-        except (TypeError, ValueError):
+        value = parse_int(data.get("value"))
+        if value is None:
             return jsonify({"error": "value must be an integer"}), 400
         if abs(value) > MAX_ADD_ABS:
             return jsonify({"error": "value too large"}), 400

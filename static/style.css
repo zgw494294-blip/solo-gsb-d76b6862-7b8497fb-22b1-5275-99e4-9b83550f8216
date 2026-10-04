@@ -143,7 +143,7 @@ header button:hover:not(:disabled) {
 }
 
 .add-group input {
-  width: 90px;
+  width: 170px;
   padding: 6px 8px;
   border: 1px solid #cbd2da;
   border-radius: 6px;

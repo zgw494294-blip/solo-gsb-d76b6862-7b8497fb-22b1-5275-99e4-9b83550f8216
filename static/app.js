@@ -105,7 +105,13 @@ async function doOp(side, op) {
       showError(side, { name: null, code: null, message: "请输入一个整数" });
       return;
     }
-    body.value = parseInt(raw, 10);
+    // 大整数以十进制字符串传输避免精度丢失；安全整数范围内仍发送数字
+    const big = BigInt(raw);
+    body.value =
+      big >= BigInt(Number.MIN_SAFE_INTEGER) &&
+      big <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(big)
+        : big.toString();
   }
   setBusy(side, true);
   clearError(side);
