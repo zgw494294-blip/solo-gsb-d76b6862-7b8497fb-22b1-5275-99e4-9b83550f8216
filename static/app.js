@@ -105,7 +105,8 @@ async function doOp(side, op) {
       showError(side, { name: null, code: null, message: "请输入一个整数" });
       return;
     }
-    body.value = parseInt(raw, 10);
+    // 原样以十进制字符串发送，避免 Number.parseInt 对超出安全整数范围的值丢精度
+    body.value = raw;
   }
   setBusy(side, true);
   clearError(side);

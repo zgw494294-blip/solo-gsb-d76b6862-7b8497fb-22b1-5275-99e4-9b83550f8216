@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -18,7 +19,42 @@ from flask import Flask, jsonify, render_template, request
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("LAB_DATA_DIR", os.path.join(BASE_DIR, "data"))
 MAX_LOG_ENTRIES = 200
-MAX_ADD_ABS = 2 ** 62  # 防止 SQLite 64 位整数溢出
+MAX_ADD_ABS = 2 ** 62  # 单次增量绝对值上限
+# 累加结果只允许落在有符号 64 位整数范围内，越界即拒绝，绝不允许 SQLite 转成 REAL
+INT64_MIN = -(2 ** 63)
+INT64_MAX = 2 ** 63 - 1
+# JavaScript Number 的安全整数范围：之内以 JSON 数字返回，之外以十进制字符串返回
+JS_SAFE_INT_MIN = -(2 ** 53 - 1)
+JS_SAFE_INT_MAX = 2 ** 53 - 1
+
+_INTEGER_RE = re.compile(r"^[+-]?\d+$")
+
+
+def decode_int(raw):
+    """无损解析请求中的整数。
+
+    接受 JSON 数字（int / 整数值 float）与十进制字符串；布尔、非整数浮点、
+    非十进制字符串一律拒绝。超出 JS 安全整数范围的值只能以字符串传输。
+    """
+    if isinstance(raw, bool):  # bool 是 int 的子类，必须先排除
+        raise ValueError("not an integer")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        # 兼容旧客户端发来的整数值浮点（如 10.0），非整数直接拒绝
+        if not raw.is_integer():
+            raise ValueError("not an integer")
+        return int(raw)
+    if isinstance(raw, str) and _INTEGER_RE.match(raw):
+        return int(raw)
+    raise ValueError("not an integer")
+
+
+def wire_int(value):
+    """整数的出参编码：JS 安全整数范围内返回数字，之外返回十进制字符串。"""
+    if JS_SAFE_INT_MIN <= value <= JS_SAFE_INT_MAX:
+        return value
+    return str(value)
 
 VALID_OPS = {"begin", "read", "add", "commit", "rollback"}
 OP_LABELS = {
@@ -65,7 +101,7 @@ class Experiment:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 "CREATE TABLE kv (id INTEGER PRIMARY KEY CHECK (id = 1),"
-                " val INTEGER NOT NULL)"
+                " val INTEGER NOT NULL, CHECK (typeof(val) = 'integer'))"
             )
             conn.execute("INSERT INTO kv (id, val) VALUES (1, 100)")
             conn.commit()
@@ -86,7 +122,7 @@ class Experiment:
         panel = self.panels[side]
         return {
             "in_transaction": self.conns[side].in_transaction,
-            "last_read": panel.last_read,
+            "last_read": None if panel.last_read is None else wire_int(panel.last_read),
             "log": list(panel.log),
         }
 
@@ -95,7 +131,7 @@ class Experiment:
             row = self.observer.execute(
                 "SELECT val FROM kv WHERE id = 1"
             ).fetchone()
-            return row[0]
+            return wire_int(row[0])
 
 
 def run_op(exp, side, op, value):
@@ -127,7 +163,18 @@ def run_op(exp, side, op, value):
             elif op == "add":
                 if not conn.in_transaction:
                     return reject("禁止事务外修改：请先 BEGIN DEFERRED")
-                conn.execute("UPDATE kv SET val = val + ? WHERE id = 1", (value,))
+                # 不做任何预读 SELECT（避免改变 DEFERRED 事务建立快照的时机），
+                # 直接执行 UPDATE：表上的 CHECK(typeof(val)='integer') 约束保证
+                # 整数加法一旦溢出成 REAL 就在亲和性转换前被数据库原子拒绝
+                # （SQLITE_CONSTRAINT_CHECK），正、负越界都拦，边界本身合法。
+                try:
+                    conn.execute("UPDATE kv SET val = val + ? WHERE id = 1", (value,))
+                except sqlite3.IntegrityError:
+                    return reject(
+                        "累加结果超出有符号 64 位整数范围（%d ~ %d），"
+                        "本次加法未执行，事务仍保持开启"
+                        % (INT64_MIN, INT64_MAX)
+                    )
                 panel.add_log("加上 %s → 成功（尚未提交）" % value)
             elif op == "commit":
                 if not conn.in_transaction:
@@ -211,8 +258,8 @@ def experiment_op(exp_id, side):
     value = None
     if op == "add":
         try:
-            value = int(data.get("value"))
-        except (TypeError, ValueError):
+            value = decode_int(data.get("value"))
+        except ValueError:
             return jsonify({"error": "value must be an integer"}), 400
         if abs(value) > MAX_ADD_ABS:
             return jsonify({"error": "value too large"}), 400
